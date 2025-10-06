@@ -1,0 +1,193 @@
+import { NextRequest, NextResponse } from "next/server";
+import { UAParser } from "ua-parser-js";
+import crypto from "crypto";
+import { promises as fs } from "fs";
+import path from "path";
+import { countriesByCode } from "@/lib/constants/countries";
+import { lookupIP } from "@/lib/geoip/maxmind-lookup";
+
+// 1x1 transparent GIF pixel (base64)
+const TRANSPARENT_PIXEL = Buffer.from(
+  'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7',
+  'base64'
+);
+
+async function getIP(request: NextRequest): Promise<string> {
+  if (process.env.USE_TEST_IP === "true" && process.env.TEST_IP) {
+    console.log("Using TEST IP", process.env.TEST_IP);
+    return process.env.TEST_IP;
+  }
+
+  let ip = "unknown";
+
+  const cfIP = request.headers.get("cf-connecting-ip");
+  if (cfIP && cfIP !== "::1") ip = cfIP;
+
+  if (ip === "unknown") {
+    const realIP = request.headers.get("x-real-ip");
+    if (realIP && realIP !== "::1") ip = realIP;
+  }
+
+  if (ip === "unknown") {
+    const forwarded = request.headers.get("x-forwarded-for");
+    if (forwarded) {
+      const first = forwarded.split(",")[0].trim();
+      if (first !== "::1" && first !== "127.0.0.1") ip = first;
+    }
+  }
+
+  if (ip === "unknown") {
+    const rIp = (request as any).ip;
+    if (rIp) ip = rIp;
+  }
+
+  if (ip === "::1" || ip === "127.0.0.1" || ip === "0.0.0.0")
+    try {
+      const res = await fetch("https://api.ipify.org?format=json", {
+        signal: AbortSignal.timeout(3000),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        ip = data.ip;
+      }
+    } catch {
+      // fallback keep localhost IP
+    }
+
+  if (ip.startsWith("::ffff:")) ip = ip.substring(7);
+
+  return ip;
+}
+
+function decodeToken(encoded: string) {
+  try {
+    const clean = encoded.replace("=%EMAIL%", "").replace(/=.*$/, "");
+    const decoded = Buffer.from(clean, "base64url").toString("utf-8");
+    const params = new URLSearchParams(decoded);
+
+    return {
+      event: params.get("e"),
+      offerId: params.get("offerID"),
+      campaignId: params.get("campaignID"),
+      email: params.get("to"),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function hashEmail(email: string | null) {
+  if (!email) return null;
+  return crypto.createHash("sha256").update(email.toLowerCase()).digest("hex");
+}
+
+async function writeFileRecord(data: any) {
+  try {
+    const dir = path.join(process.cwd(), "logs");
+    const file = path.join(dir, "tracking-events.json");
+    await fs.mkdir(dir, { recursive: true });
+    let events = [];
+    try {
+      const content = await fs.readFile(file, "utf-8");
+      events = JSON.parse(content);
+    } catch {}
+    events.push(data);
+    await fs.writeFile(file, JSON.stringify(events, null, 2), "utf-8");
+  } catch (err) {
+    console.error("Write to file failed:", err);
+  }
+}
+
+export async function GET(
+  request: NextRequest,
+  { params }: { params: Promise<{ encoded: string }> }
+) {
+  try {
+    const { encoded } = await params;
+    const data = decodeToken(encoded);
+
+    if (!data) {
+      await writeFileRecord({
+        error: "Invalid token",
+        encoded,
+        timestamp: new Date().toISOString(),
+      });
+      return new Response(TRANSPARENT_PIXEL, {
+        headers: {
+          "Content-Type": "image/gif",
+          "Cache-Control": "no-cache, no-store, must-revalidate",
+          Pragma: "no-cache",
+          Expires: "0",
+        },
+      });
+    }
+
+    const ip = await getIP(request);
+    const userAgent = request.headers.get("user-agent") || "";
+    const referer = request.headers.get("referer");
+
+    const parser = new UAParser(userAgent);
+    const ua = parser.getResult();
+
+    const geoData = await lookupIP(ip);
+
+    // Map country code to name if available
+    const countryName =
+      geoData.country && geoData.country.length === 2
+        ? countriesByCode[geoData.country] ?? geoData.country
+        : geoData.country;
+
+    const cityName =
+      geoData.city || geoData.region || "Unknown";
+
+    // Ensure ISP is not empty if possible fallback to organization
+    const ispName = geoData.isp ?? geoData.organization ?? null;
+
+    const record = {
+      id: crypto.randomUUID(),
+      campaignId: data.campaignId,
+      offerId: data.offerId,
+      event: data.event,
+      emailHash: hashEmail(data.email),
+      ip,
+      userAgent,
+      referer: referer || null,
+      country: countryName,
+      city: cityName,
+      region: geoData.region,
+      latitude: geoData.latitude,
+      longitude: geoData.longitude,
+      isp: ispName,
+      organization: geoData.organization ?? null,
+      asn: geoData.asn,
+      timezone: geoData.timezone,
+      deviceType: ua.device.type || "unknown",
+      browser: ua.browser.name || null,
+      browserVersion: ua.browser.version || null,
+      os: ua.os.name || null,
+      osVersion: ua.os.version || null,
+      createdAt: new Date().toISOString(),
+    };
+
+    await writeFileRecord(record);
+
+    return new Response(TRANSPARENT_PIXEL, {
+      headers: {
+        "Content-Type": "image/gif",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        Pragma: "no-cache",
+        Expires: "0",
+      },
+    });
+  } catch (err) {
+    console.error("Tracking error:", err);
+    return new Response(TRANSPARENT_PIXEL, {
+      headers: {
+        "Content-Type": "image/gif",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        Pragma: "no-cache",
+        Expires: "0",
+      },
+    });
+  }
+}

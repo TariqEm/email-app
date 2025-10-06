@@ -1,0 +1,230 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Sponsor {
+  id                String            @id @default(cuid())
+  name              String
+  api_driver        String
+  affiliate_number  String?
+  api_key           String?
+  username          String?
+  password          String?
+  api_url_offer     String?
+  api_url_reporting String?
+  login_driver      String?
+  tracking_template String?
+  status            SponsorStatus     @default(active)
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+  deletedAt         DateTime?
+  affiliateManagers AffiliateManager?
+  apiSyncLogs       ApiSyncLog[]
+  offers            Offer[]
+}
+
+model Offer {
+  id                String          @id @default(cuid())
+  externalOfferId   String          @unique
+  sponsorId         String
+  name              String
+  offerTrackingLink String?
+  unsbTrackingLink  String?
+  payoutType        String?
+  optizmoKey        String?
+  allowedCountries  String[]
+  payoutAmount      Float?
+  payoutCurrency    String?
+  verticalId        String?
+  geoTargeting      Json?
+  isActive          Boolean         @default(true)
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  Campaign          Campaign[]
+  sponsor           Sponsor         @relation(fields: [sponsorId], references: [id])
+  vertical          Vertical?       @relation(fields: [verticalId], references: [id])
+  trackingEvents    TrackingEvent[]
+}
+
+model Vertical {
+  id               String            @id @default(cuid())
+  name             String
+  slug             String            @unique
+  description      String?
+  iconUrl          String?
+  isActive         Boolean           @default(true)
+  parentId         String?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  campaignSegments CampaignSegment[]
+  offers           Offer[]
+  parent           Vertical?         @relation("VerticalChildren", fields: [parentId], references: [id])
+  children         Vertical[]        @relation("VerticalChildren")
+}
+
+model Campaign {
+  id                  String            @id @default(cuid())
+  offerId             String
+  name                String
+  destinationUrl      String
+  unsubscribeUrl      String
+  trackingDomainId    String?
+  isActive            Boolean?          @default(true)
+  inactiveReason      String?
+  startDate           DateTime?
+  endDate             DateTime?
+  targetCountries     String[]
+  status              CampaignStatus    @default(active)
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+  cortexClickTracking String?
+  cortexUnsbTracking  String?
+  trackingPixelLink   String?
+  clickTrackingLink   String?
+  unsubTrackingLink   String?
+  offer               Offer             @relation(fields: [offerId], references: [id])
+  trackingDomain      TrackingDomain?   @relation(fields: [trackingDomainId], references: [id])
+  campaignSegments    CampaignSegment[]
+  trackingEvents      TrackingEvent[]
+}
+
+model CampaignSegment {
+  id          String    @id @default(cuid())
+  campaignId  String
+  verticalId  String?
+  countries   String[]
+  deviceTypes String[]
+  filterRules Json?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  campaign    Campaign  @relation(fields: [campaignId], references: [id])
+  vertical    Vertical? @relation(fields: [verticalId], references: [id])
+}
+
+model TrackingEvent {
+  id             String     @id @default(cuid())
+  campaignId     String
+  offerId        String
+  eventType      EventType
+  emailHash      String
+  ip             String?
+  timestamp      DateTime   @default(now())
+  country        String?
+  referer        String?
+  city           String?
+  region         String?
+  isp            String?
+  organization   String?
+  asn            Int?
+  timezone       String?
+  deviceType     String?
+  browser        String?
+  browserVersion String?
+  os             String?
+  userAgent      String?
+  isInvalid      Boolean    @default(false)
+  additionalData Json?
+  createdAt      DateTime   @default(now())
+  emailListId    Int?
+  campaign       Campaign   @relation(fields: [campaignId], references: [id])
+  emailList      EmailList? @relation(fields: [emailListId], references: [id])
+  offer          Offer      @relation(fields: [offerId], references: [id])
+
+  @@index([campaignId])
+  @@index([eventType])
+  @@index([timestamp])
+}
+
+model TrackingDomain {
+  id              String     @id @default(cuid())
+  subdomainPrefix String
+  rootDomain      String
+  sslEnabled      Boolean    @default(false)
+  dnsVerified     Boolean    @default(false)
+  rotationEnabled Boolean    @default(false)
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+  campaigns       Campaign[]
+}
+
+model ApiSyncLog {
+  id           String   @id @default(cuid())
+  sponsorId    String
+  operation    String
+  lastSync     DateTime @default(now())
+  success      Boolean
+  recordsCount Int
+  errorMessage String?
+  sponsor      Sponsor  @relation(fields: [sponsorId], references: [id])
+}
+
+model EmailSegment {
+  id           String   @id @default(cuid())
+  countryCodes String[]
+  verticalIds  String[]
+  engagement   String?
+  customFilter Json?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model AffiliateManager {
+  id           String   @id @default(cuid())
+  sponsorId    String   @unique
+  fullName     String
+  email        String
+  telegram     String?
+  referralLink String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  sponsor      Sponsor  @relation(fields: [sponsorId], references: [id], onDelete: Cascade)
+}
+
+model EmailList {
+  id             Int             @id @default(autoincrement())
+  email          String          @unique
+  country        String?
+  ipaddress      String?
+  os             String?
+  browser        String?
+  lang           String?
+  timezone       String?
+  openCount      Int             @default(0)
+  clickCount     Int             @default(0)
+  unsubCount     Int             @default(0)
+  lastEvent      DateTime?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  trackingEvents TrackingEvent[]
+
+  @@index([email])
+}
+
+enum SponsorPlatform {
+  everflow
+  hitpath
+  hasoffers
+  cake
+}
+
+enum SponsorStatus {
+  active
+  inactive
+}
+
+enum EventType {
+  open
+  click
+  unsubscribe
+}
+
+enum CampaignStatus {
+  active
+  inactive
+  paused
+}

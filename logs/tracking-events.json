@@ -1,0 +1,27 @@
+[
+  {
+    "id": "ff0e9a18-dd1d-4b9c-9a47-e301233b048b",
+    "campaignId": "cmgb2nvbz0004uekwlv0hfowg",
+    "offerId": "cmgb2nv4v0002uekwex9u7ut1",
+    "event": "open",
+    "emailHash": "4d5c137182a90433e6515de75fb41755fe40db41e8706bbf70efee924e04985e",
+    "ip": "79.95.86.xxx",
+    "userAgent": "Mozilla/5.0 (Linux; Android 8.0.0; SM-G955U Build/R16NW) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36",
+    "referer": null,
+    "country": "France",
+    "city": "Nantes",
+    "region": "Pays de la Loire",
+    "latitude": 47.2145,
+    "longitude": -1.5512,
+    "isp": "SFR",
+    "organization": "Societe Francaise Du Radiotelephone - SFR SA",
+    "asn": 15557,
+    "timezone": "Europe/Paris",
+    "deviceType": "mobile",
+    "browser": "Mobile Chrome",
+    "browserVersion": "140.0.0.0",
+    "os": "Android",
+    "osVersion": "8.0.0",
+    "createdAt": "2025-10-03T16:44:56.947Z"
+  }
+]
