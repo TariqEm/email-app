@@ -91,15 +91,20 @@ async function getIP(request: NextRequest): Promise<string> {
 }
 
 // Helper to convert GeoData (null) to clean type (undefined)
-function cleanGeoData(geoData: any): GeoDataClean {
+function cleanGeoData(geoData: unknown): GeoDataClean {
+  if (typeof geoData !== 'object' || geoData === null) {
+    return {};
+  }
+  
+  const data = geoData as Record<string, unknown>;
   return {
-    country: geoData.country ?? undefined,
-    region: geoData.region ?? undefined,
-    city: geoData.city ?? undefined,
-    timezone: geoData.timezone ?? undefined,
-    isp: geoData.isp ?? undefined,
-    organization: geoData.organization ?? undefined,
-    asn: geoData.asn ?? undefined,
+    country: typeof data.country === 'string' ? data.country : undefined,
+    region: typeof data.region === 'string' ? data.region : undefined,
+    city: typeof data.city === 'string' ? data.city : undefined,
+    timezone: typeof data.timezone === 'string' ? data.timezone : undefined,
+    isp: typeof data.isp === 'string' ? data.isp : undefined,
+    organization: typeof data.organization === 'string' ? data.organization : undefined,
+    asn: typeof data.asn === 'number' ? data.asn : undefined,
   };
 }
 
