@@ -11,6 +11,22 @@ interface NextRequestWithIp extends NextRequest {
   ip?: string;
 }
 
+type GeoDataClean = {
+  country?: string;
+  region?: string;
+  city?: string;
+  timezone?: string;
+  isp?: string;
+  organization?: string;
+  asn?: number;
+};
+
+type UAResult = {
+  os: { name?: string };
+  browser: { name?: string; version?: string };
+  device: { type?: string };
+};
+
 // 1x1 transparent GIF pixel (base64)
 const TRANSPARENT_PIXEL = Buffer.from(
   'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7',
@@ -90,6 +106,19 @@ function hashEmail(email: string | null) {
   return crypto.createHash("sha256").update(email.toLowerCase()).digest("hex");
 }
 
+function cleanGeoData(geoData: unknown): GeoDataClean {
+  const data = geoData as Record<string, unknown>;
+  return {
+    country: typeof data.country === 'string' ? data.country : undefined,
+    region: typeof data.region === 'string' ? data.region : undefined,
+    city: typeof data.city === 'string' ? data.city : undefined,
+    timezone: typeof data.timezone === 'string' ? data.timezone : undefined,
+    isp: typeof data.isp === 'string' ? data.isp : undefined,
+    organization: typeof data.organization === 'string' ? data.organization : undefined,
+    asn: typeof data.asn === 'number' ? data.asn : undefined,
+  };
+}
+
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ encoded: string }> }
@@ -97,7 +126,6 @@ export async function GET(
   try {
     const { encoded } = await params;
 
-    // Extract email from path
     const url = new URL(request.url);
     const pathname = url.pathname;
     const splitIndex = pathname.indexOf('=');
@@ -107,13 +135,11 @@ export async function GET(
     }
     const normalizedEmail = email.trim().toLowerCase();
 
-    // Decode token
     const data = decodeToken(encoded);
     if (!data) {
       return new Response(TRANSPARENT_PIXEL, { headers: PIXEL_HEADERS });
     }
 
-    // ⚡ Get campaign first
     const campaignWithOffer = await prisma.campaign.findUnique({
       where: { id: data.campaignId! },
       select: {
@@ -125,19 +151,17 @@ export async function GET(
       return new Response(TRANSPARENT_PIXEL, { headers: PIXEL_HEADERS });
     }
 
-    // ⚡ Get IP
     const ip = await getIP(request);
-
-    // ⚡ Parallel execution
     const userAgent = request.headers.get("user-agent") || "";
     const referer = request.headers.get("referer") || null;
 
-    const [geoData, ua] = await Promise.all([
+    const [geoDataRaw, ua] = await Promise.all([
       lookupIP(ip),
       Promise.resolve(new UAParser(userAgent).getResult())
     ]);
 
-    // ✅ FRAUD DETECTION
+    const geoData = cleanGeoData(geoDataRaw as unknown as Record<string, unknown>);
+
     const fraudCheck = FraudDetector.check({
       ip,
       isp: geoData.isp,
@@ -147,22 +171,23 @@ export async function GET(
     const isFraud = fraudCheck.isFraud;
     const fraudReason = fraudCheck.reason;
 
-    // ⚡ ALWAYS RETURN PIXEL IMMEDIATELY (even for fraud)
     const response = new Response(TRANSPARENT_PIXEL, { headers: PIXEL_HEADERS });
 
-    // Process in background (don't block pixel response)
-    processOpenEvent(
-      data,
-      normalizedEmail,
-      ip,
-      userAgent,
-      referer,
-      geoData,
-      ua,
-      campaignWithOffer.offer.allowedCountries,
-      isFraud,
-      fraudReason
-    ).catch(console.error);
+    if (data.campaignId && data.offerId) {
+      processOpenEvent(
+        data.campaignId,
+        data.offerId,
+        normalizedEmail,
+        ip,
+        userAgent,
+        referer,
+        geoData,
+        ua,
+        campaignWithOffer.offer.allowedCountries,
+        isFraud,
+        fraudReason
+      ).catch(console.error);
+    }
 
     return response;
 
@@ -172,15 +197,15 @@ export async function GET(
   }
 }
 
-// 🚀 ASYNC - Process open event in background
 async function processOpenEvent(
-  data: any,
+  campaignId: string,
+  offerId: string,
   email: string,
   ip: string,
   userAgent: string,
   referer: string | null,
-  geoData: any,
-  ua: any,
+  geoData: GeoDataClean,
+  ua: UAResult,
   allowedCountries: string[],
   isFraud: boolean,
   fraudReason?: string
@@ -190,7 +215,6 @@ async function processOpenEvent(
     const countryName = countriesByCode[countryCode] ?? countryCode;
     const cityName = geoData.city || geoData.region || "Unknown";
 
-    // Device type detection
     const uaLower = userAgent.toLowerCase();
     const osName = ua.os.name?.toLowerCase() || '';
     const isAndroid = osName.includes('android') || uaLower.includes('android');
@@ -216,10 +240,8 @@ async function processOpenEvent(
       }
     }
 
-    // Check country validity
     const isInvalid = !allowedCountries.includes(countryName);
 
-    // If fraud, don't update emailList counts
     if (!isFraud) {
       await prisma.emailList.upsert({
         where: { email },
@@ -245,7 +267,6 @@ async function processOpenEvent(
       });
     }
 
-    // Save tracking event
     const emailList = await prisma.emailList.findUnique({
       where: { email },
       select: { id: true }
@@ -253,8 +274,8 @@ async function processOpenEvent(
 
     await prisma.trackingEvent.create({
       data: {
-        campaignId: data.campaignId,
-        offerId: data.offerId,
+        campaignId,
+        offerId,
         eventType: EventType.open,
         emailHash: hashEmail(email),
         ip,

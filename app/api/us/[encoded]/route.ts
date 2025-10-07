@@ -11,6 +11,22 @@ interface NextRequestWithIp extends NextRequest {
   ip?: string;
 }
 
+type GeoDataClean = {
+  country?: string;
+  region?: string;
+  city?: string;
+  timezone?: string;
+  isp?: string;
+  organization?: string;
+  asn?: number;
+};
+
+type UAResult = {
+  os: { name?: string };
+  browser: { name?: string; version?: string };
+  device: { type?: string };
+};
+
 function decodeToken(encoded: string) {
   try {
     const clean = encoded.replace("=%EMAIL%", "").replace(/=.*$/, "");
@@ -72,6 +88,19 @@ async function getIP(request: NextRequest): Promise<string> {
   return ip;
 }
 
+function cleanGeoData(geoData: unknown): GeoDataClean {
+  const data = geoData as Record<string, unknown>;
+  return {
+    country: typeof data.country === 'string' ? data.country : undefined,
+    region: typeof data.region === 'string' ? data.region : undefined,
+    city: typeof data.city === 'string' ? data.city : undefined,
+    timezone: typeof data.timezone === 'string' ? data.timezone : undefined,
+    isp: typeof data.isp === 'string' ? data.isp : undefined,
+    organization: typeof data.organization === 'string' ? data.organization : undefined,
+    asn: typeof data.asn === 'number' ? data.asn : undefined,
+  };
+}
+
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ encoded: string }> }
@@ -79,7 +108,6 @@ export async function GET(
   try {
     const { encoded } = await params;
 
-    // Extract email from path
     const url = new URL(request.url);
     const pathname = url.pathname;
     const splitIndex = pathname.indexOf('=');
@@ -89,15 +117,13 @@ export async function GET(
     }
     const normalizedEmail = email.trim().toLowerCase();
 
-    // Decode token
     const data = decodeToken(encoded);
-    if (!data) {
+    if (!data || !data.campaignId || !data.offerId) {
       return new NextResponse('Invalid unsubscribe link', { status: 400 });
     }
 
-    // ⚡ Get campaign and redirect URL first
     const campaign = await prisma.campaign.findUnique({
-      where: { id: data.campaignId! },
+      where: { id: data.campaignId },
       select: {
         cortexUnsbTracking: true,
         offer: { select: { allowedCountries: true } }
@@ -109,22 +135,20 @@ export async function GET(
     }
 
     const redirectUrl = campaign.cortexUnsbTracking;
-
-    // ⚡ Get IP
     const ip = await getIP(request);
 
-    // ⚡ Parallel execution
     const userAgent = request.headers.get("user-agent") || "";
-    const [geoData, ua] = await Promise.all([
+    const [geoDataRaw, ua] = await Promise.all([
       lookupIP(ip),
       Promise.resolve(new UAParser(userAgent).getResult())
     ]);
+
+    const geoData = cleanGeoData(geoDataRaw);
 
     const countryCode = geoData.country || "";
     const countryName = countriesByCode[countryCode] ?? countryCode;
     const cityName = geoData.city || geoData.region || "Unknown";
 
-    // ✅ FRAUD DETECTION CHECK
     const fraudCheck = FraudDetector.check({
       ip,
       isp: geoData.isp,
@@ -134,16 +158,24 @@ export async function GET(
     const isFraud = fraudCheck.isFraud;
     const fraudReason = fraudCheck.reason;
 
-    // Check country
     const allowedCountries = campaign.offer.allowedCountries || [];
     const isInvalid = !allowedCountries.includes(countryName);
 
-    // ⚡ BLOCK FRAUD UNSUBSCRIBES
     if (isFraud) {
       console.log(`🚫 FRAUD BLOCKED (Unsubscribe): ${fraudReason} | ${normalizedEmail} from ${ip}`);
 
-      // Save fraud event async
-      saveFraudUnsubscribe(data, normalizedEmail, ip, userAgent, geoData, countryName, cityName, ua, fraudReason).catch(console.error);
+      saveFraudUnsubscribe(
+        data.campaignId,
+        data.offerId,
+        normalizedEmail,
+        ip,
+        userAgent,
+        geoData,
+        countryName,
+        cityName,
+        ua,
+        fraudReason
+      ).catch(console.error);
 
       return new NextResponse(
         `<html><body><h1>Access Denied</h1></body></html>`,
@@ -151,11 +183,20 @@ export async function GET(
       );
     }
 
-    // ⚡ REDIRECT IMMEDIATELY - Track in background
     const response = NextResponse.redirect(redirectUrl);
 
-    // Save valid/invalid unsubscribe async
-    saveUnsubscribe(data, normalizedEmail, ip, userAgent, geoData, countryName, cityName, ua, isInvalid).catch(console.error);
+    saveUnsubscribe(
+      data.campaignId,
+      data.offerId,
+      normalizedEmail,
+      ip,
+      userAgent,
+      geoData,
+      countryName,
+      cityName,
+      ua,
+      isInvalid
+    ).catch(console.error);
 
     console.log(`✅ ${isInvalid ? 'INVALID' : 'VALID'} Unsubscribe: ${normalizedEmail} → ${redirectUrl}`);
 
@@ -167,16 +208,16 @@ export async function GET(
   }
 }
 
-// 🚀 ASYNC - Save valid/invalid unsubscribe
 async function saveUnsubscribe(
-  data: any,
+  campaignId: string,
+  offerId: string,
   email: string,
   ip: string,
   userAgent: string,
-  geoData: any,
+  geoData: GeoDataClean,
   countryName: string,
   cityName: string,
-  ua: any,
+  ua: UAResult,
   isInvalid: boolean
 ) {
   try {
@@ -205,8 +246,8 @@ async function saveUnsubscribe(
 
     await prisma.trackingEvent.create({
       data: {
-        campaignId: data.campaignId,
-        offerId: data.offerId,
+        campaignId,
+        offerId,
         eventType: EventType.unsubscribe,
         emailHash: crypto.createHash("sha256").update(email).digest("hex"),
         ip,
@@ -233,23 +274,23 @@ async function saveUnsubscribe(
   }
 }
 
-// 🚫 ASYNC - Save fraud unsubscribe
 async function saveFraudUnsubscribe(
-  data: any,
+  campaignId: string,
+  offerId: string,
   email: string,
   ip: string,
   userAgent: string,
-  geoData: any,
+  geoData: GeoDataClean,
   countryName: string,
   cityName: string,
-  ua: any,
+  ua: UAResult,
   fraudReason?: string
 ) {
   try {
     await prisma.trackingEvent.create({
       data: {
-        campaignId: data.campaignId,
-        offerId: data.offerId,
+        campaignId,
+        offerId,
         eventType: EventType.unsubscribe,
         emailHash: crypto.createHash("sha256").update(email).digest("hex"),
         ip,
