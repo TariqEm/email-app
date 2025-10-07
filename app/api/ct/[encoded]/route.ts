@@ -5,6 +5,7 @@ import { countriesByCode } from "@/lib/constants/countries";
 import { EventType } from '@prisma/client';
 import { lookupIP } from "@/lib/geoip/maxmind-lookup";
 import { prisma } from "@/lib/prisma";
+import { FraudDetector } from "@/lib/fraud/fraud-detector";
 
 interface NextRequestWithIp extends NextRequest {
   ip?: string;
@@ -35,99 +36,6 @@ async function getEmailFromUrl(request: NextRequest): Promise<string> {
   return decodeURIComponent(pathname.substring(equalSignIndex + 1));
 }
 
-export async function GET(request: NextRequest, { params }: { params: Promise<{ encoded: string }> }) {
-  try {
-    const { encoded } = await params;
-
-    // Extract actual email from path after '='
-    const emailRaw = await getEmailFromUrl(request);
-    const email = emailRaw.trim().toLowerCase();
-
-    // Decode token part only (without '=email')
-    const data = decodeToken(encoded);
-    if (!data) {
-      return NextResponse.redirect(new URL("/", request.url));
-    }
-
-    const campaign = await prisma.campaign.findUnique({
-      where: { id: data.campaignId! },
-    });
-    if (!campaign?.cortexClickTracking) {
-      return NextResponse.redirect(new URL("/", request.url));
-    }
-
-    const ip = await getIP(request);
-    const userAgent = request.headers.get("user-agent") || "";
-    const ua = new UAParser(userAgent).getResult();
-
-    const geoData = await lookupIP(ip);
-    const countryCode = geoData.country || "";
-    const countryName = countriesByCode[countryCode] ?? countryCode;
-    const cityName = geoData.city || geoData.region || "Unknown";
-
-    const validEvents: string[] = Object.values(EventType);
-    const eventType: EventType = data.event && validEvents.includes(data.event) ? data.event as EventType : EventType.click;
-
-    // Upsert EmailList with normalized email
-    const emailList = await prisma.emailList.upsert({
-      where: { email },
-      update: {
-        clickCount: { increment: 1 },
-        lastEvent: new Date(),
-        country: countryName,
-        ipaddress: ip,
-        os: ua.os.name ?? null,
-        browser: ua.browser.name ?? null,
-        timezone: geoData.timezone ?? null,
-      },
-      create: {
-        email,
-        country: countryName,
-        ipaddress: ip,
-        os: ua.os.name ?? null,
-        browser: ua.browser.name ?? null,
-        timezone: geoData.timezone ?? null,
-        clickCount: 1,
-        lastEvent: new Date(),
-      },
-    });
-
-    // Create tracking event
-    await prisma.trackingEvent.create({
-      data: {
-        campaignId: data.campaignId!,
-        offerId: data.offerId!,
-        eventType,
-        emailHash: crypto.createHash("sha256").update(email).digest("hex"),
-        ip,
-        userAgent,
-        country: countryName,
-        city: cityName,
-        region: geoData.region,
-        isp: geoData.isp ?? geoData.organization ?? null,
-        organization: geoData.organization ?? null,
-        asn: geoData.asn ?? undefined,
-        timezone: geoData.timezone,
-        deviceType: ua.device.type ?? "unknown",
-        browser: ua.browser.name ?? null,
-        browserVersion: ua.browser.version ?? null,
-        os: ua.os.name ?? null,
-        createdAt: new Date(),
-        emailListId: emailList.id,
-      },
-    });
-
-    // Redirect to cortexClickTracking URL
-    return NextResponse.redirect(campaign.cortexClickTracking);
-  } catch (error: unknown) {
-    if (error instanceof Error) {
-        console.error("Click tracking error:", error);
-        return NextResponse.redirect(new URL("/", request.url));
-    }
-  }
-}
-
-// Include your getIP function here as in your open pixel code
 async function getIP(request: NextRequest): Promise<string> {
   if (process.env.USE_TEST_IP === "true" && process.env.TEST_IP) {
     console.log("Using TEST IP", process.env.TEST_IP);
@@ -204,4 +112,197 @@ async function getIP(request: NextRequest): Promise<string> {
   }
 
   return ip;
+}
+
+export async function GET(request: NextRequest, { params }: { params: Promise<{ encoded: string }> }) {
+  try {
+    const { encoded } = await params;
+
+    const emailRaw = await getEmailFromUrl(request);
+    const email = emailRaw.trim().toLowerCase();
+
+    const data = decodeToken(encoded);
+    if (!data) {
+      return new NextResponse('Invalid link', { status: 400 });
+    }
+
+    // ⚡ STEP 1: Get campaign and redirect URL FIRST (fastest query)
+    const campaign = await prisma.campaign.findUnique({
+      where: { id: data.campaignId! },
+      select: { 
+        cortexClickTracking: true,
+        offer: { select: { allowedCountries: true } }
+      },
+    });
+
+    if (!campaign?.cortexClickTracking) {
+      return new NextResponse('Invalid campaign', { status: 404 });
+    }
+
+    const redirectUrl = campaign.cortexClickTracking;
+
+    // ⚡ STEP 2: Get IP immediately
+    const ip = await getIP(request);
+
+    // ⚡ STEP 3: Parallel execution - get geo data while parsing user agent
+    const userAgent = request.headers.get("user-agent") || "";
+    const [geoData, ua] = await Promise.all([
+      lookupIP(ip),
+      Promise.resolve(new UAParser(userAgent).getResult())
+    ]);
+
+    const countryCode = geoData.country || "";
+    const countryName = countriesByCode[countryCode] ?? countryCode;
+    const cityName = geoData.city || geoData.region || "Unknown";
+
+    // ⚡ STEP 4: Quick fraud check (in-memory, super fast)
+    const fraudCheck = FraudDetector.check({
+      ip,
+      isp: geoData.isp,
+      organization: geoData.organization
+    });
+
+    const isFraud = fraudCheck.isFraud;
+    const fraudReason = fraudCheck.reason;
+
+    // ⚡ STEP 5: Check country (fast array lookup)
+    const allowedCountries = campaign.offer.allowedCountries || [];
+    const isInvalid = !allowedCountries.includes(countryName);
+
+    // ⚡ STEP 6: IMMEDIATE REDIRECT (don't wait for DB writes)
+    if (isFraud) {
+      console.log(`🚫 FRAUD BLOCKED: ${fraudReason} | ${email} from ${ip}`);
+      
+      // Write to DB async (don't await)
+      saveFraudEvent(data, email, ip, userAgent, geoData, countryName, cityName, ua, fraudReason).catch(console.error);
+      
+      return new NextResponse(
+        `<html><body><h1>Access Denied</h1></body></html>`,
+        { status: 403, headers: { 'Content-Type': 'text/html' } }
+      );
+    }
+
+    // ⚡ REDIRECT IMMEDIATELY - Track in background
+    const response = NextResponse.redirect(redirectUrl);
+
+    // Save to DB asynchronously (don't block redirect)
+    saveClickEvent(data, email, ip, userAgent, geoData, countryName, cityName, ua, isInvalid).catch(console.error);
+
+    console.log(`✅ ${isInvalid ? 'INVALID' : 'VALID'} Click: ${email} → ${redirectUrl}`);
+
+    return response;
+
+  } catch (error) {
+    console.error("❌ Click error:", error);
+    return new NextResponse('Error', { status: 500 });
+  }
+}
+
+// 🚀 ASYNC FUNCTION - Saves valid/invalid click without blocking redirect
+async function saveClickEvent(
+  data: any,
+  email: string,
+  ip: string,
+  userAgent: string,
+  geoData: any,
+  countryName: string,
+  cityName: string,
+  ua: any,
+  isInvalid: boolean
+) {
+  try {
+    const emailList = await prisma.emailList.upsert({
+      where: { email },
+      update: {
+        clickCount: { increment: 1 },
+        lastEvent: new Date(),
+        country: countryName,
+        ipaddress: ip,
+        os: ua.os.name ?? null,
+        browser: ua.browser.name ?? null,
+        timezone: geoData.timezone ?? null,
+      },
+      create: {
+        email,
+        country: countryName,
+        ipaddress: ip,
+        os: ua.os.name ?? null,
+        browser: ua.browser.name ?? null,
+        timezone: geoData.timezone ?? null,
+        clickCount: 1,
+        lastEvent: new Date(),
+      },
+    });
+
+    await prisma.trackingEvent.create({
+      data: {
+        campaignId: data.campaignId,
+        offerId: data.offerId,
+        eventType: 'click',
+        emailHash: crypto.createHash("sha256").update(email).digest("hex"),
+        ip,
+        userAgent,
+        country: countryName,
+        city: cityName,
+        region: geoData.region,
+        isp: geoData.isp ?? geoData.organization ?? null,
+        organization: geoData.organization ?? null,
+        asn: geoData.asn ?? undefined,
+        timezone: geoData.timezone,
+        deviceType: ua.device.type ?? "unknown",
+        browser: ua.browser.name ?? null,
+        browserVersion: ua.browser.version ?? null,
+        os: ua.os.name ?? null,
+        isInvalid,  // Country not allowed
+        isFraud: false, // Not fraud
+        createdAt: new Date(),
+        emailListId: emailList.id,
+      },
+    });
+  } catch (error) {
+    console.error('Failed to save click event:', error);
+  }
+}
+
+// 🚫 ASYNC FUNCTION - Saves fraud event without blocking
+async function saveFraudEvent(
+  data: any,
+  email: string,
+  ip: string,
+  userAgent: string,
+  geoData: any,
+  countryName: string,
+  cityName: string,
+  ua: any,
+  fraudReason?: string
+) {
+  try {
+    await prisma.trackingEvent.create({
+      data: {
+        campaignId: data.campaignId,
+        offerId: data.offerId,
+        eventType: 'click',
+        emailHash: crypto.createHash("sha256").update(email).digest("hex"),
+        ip,
+        userAgent,
+        country: countryName,
+        city: cityName,
+        region: geoData.region,
+        isp: geoData.isp ?? geoData.organization ?? null,
+        organization: geoData.organization ?? null,
+        asn: geoData.asn ?? undefined,
+        timezone: geoData.timezone,
+        deviceType: ua.device.type ?? "unknown",
+        browser: ua.browser.name ?? null,
+        browserVersion: ua.browser.version ?? null,
+        os: ua.os.name ?? null,
+        isInvalid: false,   // Not tracked as invalid
+        isFraud: true,      // Tracked as fraud
+        fraudReason,        // Why it was blocked
+        createdAt: new Date(),
+      },
+    });
+  } catch (error) {
+    console.error('Failed to save fraud event:', error);
+  }
 }

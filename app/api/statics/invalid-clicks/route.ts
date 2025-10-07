@@ -14,14 +14,18 @@ export async function GET(req: NextRequest) {
     const startDate = new Date(startDateStr);
     const endDate = new Date(endDateStr);
 
+    // Validate dates
     if (isNaN(startDate.getTime()) || isNaN(endDate.getTime()) || startDate > endDate) {
       return NextResponse.json({ count: 0 });
     }
 
+    // Count invalid clicks (exclude fraud)
+    // Invalid = wrong country but not fraud/datacenter/VPN
     const count = await prisma.trackingEvent.count({
       where: {
         eventType: 'click',
         isInvalid: true,
+        isFraud: false, // Exclude fraud
         timestamp: {
           gte: startDate,
           lte: endDate,
@@ -31,7 +35,7 @@ export async function GET(req: NextRequest) {
 
     return NextResponse.json({ count });
   } catch (error) {
-    console.error('Error fetching invalid clicks count', error);
+    console.error('Error fetching invalid clicks:', error);
     return NextResponse.json({ count: 0 });
   }
 }

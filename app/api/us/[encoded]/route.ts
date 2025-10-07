@@ -5,6 +5,7 @@ import { countriesByCode } from "@/lib/constants/countries";
 import { EventType } from '@prisma/client';
 import { lookupIP } from "@/lib/geoip/maxmind-lookup";
 import { prisma } from "@/lib/prisma";
+import { FraudDetector } from "@/lib/fraud/fraud-detector";
 
 interface NextRequestWithIp extends NextRequest {
   ip?: string;
@@ -29,75 +30,41 @@ function decodeToken(encoded: string) {
 
 async function getIP(request: NextRequest): Promise<string> {
   if (process.env.USE_TEST_IP === "true" && process.env.TEST_IP) {
-    console.log("Using TEST IP", process.env.TEST_IP);
     return process.env.TEST_IP;
   }
 
-  let ip = "";
+  let ip =
+    request.headers.get("cf-connecting-ip") ||
+    request.headers.get("x-real-ip") ||
+    request.headers.get("x-forwarded-for")?.split(",")[0].trim() ||
+    "";
 
-  // Try Cloudflare
-  const cfIP = request.headers.get("cf-connecting-ip");
-  if (cfIP) {
-    ip = cfIP;
+  if ('ip' in request && !ip) {
+    ip = (request as NextRequestWithIp).ip || "";
   }
 
-  // Try X-Real-IP
-  if (!ip) {
-    const realIP = request.headers.get("x-real-ip");
-    if (realIP) {
-      ip = realIP;
-    }
-  }
-
-  // Try X-Forwarded-For
-  if (!ip) {
-    const forwarded = request.headers.get("x-forwarded-for");
-    if (forwarded) {
-      const first = forwarded.split(",")[0].trim();
-      ip = first;
-    }
-  }
-
-  // Try request.ip if available
-  if (!ip) {
-    if ('ip' in request) {
-      const rIp = (request as NextRequestWithIp).ip;
-      if (rIp) {
-        ip = rIp;
-      }
-    }
-  }
-
-  // Clean IPv6 mapped IPv4
   if (ip.startsWith("::ffff:")) {
     ip = ip.substring(7);
   }
 
-  // CHECK IF IP IS LOCALHOST/PRIVATE - if so, fetch public IP
-  const isLocalOrPrivate = 
+  const isLocalOrPrivate =
     !ip ||
-    ip === "::1" || 
-    ip === "127.0.0.1" || 
+    ip === "::1" ||
+    ip === "127.0.0.1" ||
     ip === "0.0.0.0" ||
     ip.startsWith("192.168.") ||
     ip.startsWith("10.");
 
   if (isLocalOrPrivate) {
     try {
-      console.log("⚠️ Detected local/private IP:", ip, "- fetching public IP...");
       const res = await fetch("https://api.ipify.org?format=json", {
-        signal: AbortSignal.timeout(3000),
+        signal: AbortSignal.timeout(2000),
       });
       if (res.ok) {
         const data = await res.json();
         ip = data.ip;
-        console.log("✅ Public IP fetched:", ip);
-      } else {
-        console.error("❌ Failed to fetch public IP, status:", res.status);
-        ip = "unknown";
       }
-    } catch (error) {
-      console.error("❌ Failed to fetch public IP:", error);
+    } catch {
       ip = "unknown";
     }
   }
@@ -112,7 +79,7 @@ export async function GET(
   try {
     const { encoded } = await params;
 
-    // Extract actual email from the path after '='
+    // Extract email from path
     const url = new URL(request.url);
     const pathname = url.pathname;
     const splitIndex = pathname.indexOf('=');
@@ -122,35 +89,99 @@ export async function GET(
     }
     const normalizedEmail = email.trim().toLowerCase();
 
-    // Decode token part only (do not use email from inside token!)
+    // Decode token
     const data = decodeToken(encoded);
     if (!data) {
-      // Invalid token, just redirect silently
-      return NextResponse.redirect(new URL("/", request.url));
+      return new NextResponse('Invalid unsubscribe link', { status: 400 });
     }
 
-    // Retrieve campaign and check Cortex unsubscribe tracking URL
+    // ⚡ Get campaign and redirect URL first
     const campaign = await prisma.campaign.findUnique({
       where: { id: data.campaignId! },
+      select: {
+        cortexUnsbTracking: true,
+        offer: { select: { allowedCountries: true } }
+      },
     });
 
     if (!campaign?.cortexUnsbTracking) {
-      // No Cortex unsubscribe URL, fallback redirect
-      return NextResponse.redirect(new URL("/", request.url));
+      return new NextResponse('Invalid campaign', { status: 404 });
     }
 
-    const ip = await getIP(request);
-    const userAgent = request.headers.get("user-agent") || "";
-    const ua = new UAParser(userAgent).getResult();
+    const redirectUrl = campaign.cortexUnsbTracking;
 
-    const geoData = await lookupIP(ip);
+    // ⚡ Get IP
+    const ip = await getIP(request);
+
+    // ⚡ Parallel execution
+    const userAgent = request.headers.get("user-agent") || "";
+    const [geoData, ua] = await Promise.all([
+      lookupIP(ip),
+      Promise.resolve(new UAParser(userAgent).getResult())
+    ]);
+
     const countryCode = geoData.country || "";
     const countryName = countriesByCode[countryCode] ?? countryCode;
     const cityName = geoData.city || geoData.region || "Unknown";
 
-    // Upsert email list record incrementing unsubCount
+    // ✅ FRAUD DETECTION CHECK
+    const fraudCheck = FraudDetector.check({
+      ip,
+      isp: geoData.isp,
+      organization: geoData.organization
+    });
+
+    const isFraud = fraudCheck.isFraud;
+    const fraudReason = fraudCheck.reason;
+
+    // Check country
+    const allowedCountries = campaign.offer.allowedCountries || [];
+    const isInvalid = !allowedCountries.includes(countryName);
+
+    // ⚡ BLOCK FRAUD UNSUBSCRIBES
+    if (isFraud) {
+      console.log(`🚫 FRAUD BLOCKED (Unsubscribe): ${fraudReason} | ${normalizedEmail} from ${ip}`);
+
+      // Save fraud event async
+      saveFraudUnsubscribe(data, normalizedEmail, ip, userAgent, geoData, countryName, cityName, ua, fraudReason).catch(console.error);
+
+      return new NextResponse(
+        `<html><body><h1>Access Denied</h1></body></html>`,
+        { status: 403, headers: { 'Content-Type': 'text/html' } }
+      );
+    }
+
+    // ⚡ REDIRECT IMMEDIATELY - Track in background
+    const response = NextResponse.redirect(redirectUrl);
+
+    // Save valid/invalid unsubscribe async
+    saveUnsubscribe(data, normalizedEmail, ip, userAgent, geoData, countryName, cityName, ua, isInvalid).catch(console.error);
+
+    console.log(`✅ ${isInvalid ? 'INVALID' : 'VALID'} Unsubscribe: ${normalizedEmail} → ${redirectUrl}`);
+
+    return response;
+
+  } catch (error) {
+    console.error("❌ Unsubscribe error:", error);
+    return new NextResponse('Error', { status: 500 });
+  }
+}
+
+// 🚀 ASYNC - Save valid/invalid unsubscribe
+async function saveUnsubscribe(
+  data: any,
+  email: string,
+  ip: string,
+  userAgent: string,
+  geoData: any,
+  countryName: string,
+  cityName: string,
+  ua: any,
+  isInvalid: boolean
+) {
+  try {
     const emailList = await prisma.emailList.upsert({
-      where: { email: normalizedEmail },
+      where: { email },
       update: {
         unsubCount: { increment: 1 },
         lastEvent: new Date(),
@@ -161,7 +192,7 @@ export async function GET(
         timezone: geoData.timezone ?? null,
       },
       create: {
-        email: normalizedEmail,
+        email,
         country: countryName,
         ipaddress: ip,
         os: ua.os.name ?? null,
@@ -172,13 +203,12 @@ export async function GET(
       }
     });
 
-    // Create tracking event
     await prisma.trackingEvent.create({
       data: {
-        campaignId: data.campaignId!,
-        offerId: data.offerId!,
+        campaignId: data.campaignId,
+        offerId: data.offerId,
         eventType: EventType.unsubscribe,
-        emailHash: crypto.createHash("sha256").update(normalizedEmail).digest("hex"),
+        emailHash: crypto.createHash("sha256").update(email).digest("hex"),
         ip,
         userAgent,
         country: countryName,
@@ -192,17 +222,56 @@ export async function GET(
         browser: ua.browser.name ?? null,
         browserVersion: ua.browser.version ?? null,
         os: ua.os.name ?? null,
+        isInvalid,
+        isFraud: false,
         createdAt: new Date(),
         emailListId: emailList.id,
       }
     });
-
-    // Redirect to the Cortex unsubscribe tracking URL
-    return NextResponse.redirect(campaign.cortexUnsbTracking);
-
   } catch (error) {
-    console.error("Unsubscribe tracking error:", error);
-    // Fallback generic redirect or 404 page
-    return NextResponse.redirect(new URL("/", request.url));
+    console.error('Failed to save unsubscribe:', error);
+  }
+}
+
+// 🚫 ASYNC - Save fraud unsubscribe
+async function saveFraudUnsubscribe(
+  data: any,
+  email: string,
+  ip: string,
+  userAgent: string,
+  geoData: any,
+  countryName: string,
+  cityName: string,
+  ua: any,
+  fraudReason?: string
+) {
+  try {
+    await prisma.trackingEvent.create({
+      data: {
+        campaignId: data.campaignId,
+        offerId: data.offerId,
+        eventType: EventType.unsubscribe,
+        emailHash: crypto.createHash("sha256").update(email).digest("hex"),
+        ip,
+        userAgent,
+        country: countryName,
+        city: cityName,
+        region: geoData.region,
+        isp: geoData.isp ?? geoData.organization ?? null,
+        organization: geoData.organization ?? null,
+        asn: geoData.asn ?? undefined,
+        timezone: geoData.timezone,
+        deviceType: ua.device.type ?? "unknown",
+        browser: ua.browser.name ?? null,
+        browserVersion: ua.browser.version ?? null,
+        os: ua.os.name ?? null,
+        isInvalid: false,
+        isFraud: true,
+        fraudReason,
+        createdAt: new Date(),
+      }
+    });
+  } catch (error) {
+    console.error('Failed to save fraud unsubscribe:', error);
   }
 }
